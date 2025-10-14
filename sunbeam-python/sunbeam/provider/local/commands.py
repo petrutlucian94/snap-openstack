@@ -577,9 +577,9 @@ def deploy_and_migrate_juju_controller(
     multiple=True,
     default=["control", "compute"],
     callback=validate_roles,
-    help="Specify additional roles, compute, storage or network, for the "
-    "bootstrap node. Defaults to the compute role."
-    " Can be repeated and comma separated.",
+    help="Specify additional roles for the bootstrap node. "
+    "Possible values: compute, storage, network, region-controller. "
+    "Defaults to the compute role. Can be repeated and comma separated.",
 )
 @click_option_topology
 @click_option_database
@@ -625,18 +625,24 @@ def bootstrap(
     LOG.debug(f"Manifest used for deployment - core: {manifest.core}")
     LOG.debug(f"Manifest used for deployment - features: {manifest.features}")
 
-    # Bootstrap node must always have the control role
-    if Role.CONTROL not in roles:
+    # Bootstrap node must always have the control role or region controller
+    # role.
+    if Role.CONTROL not in roles and Role.REGION_CONTROLLER not in roles:
         LOG.debug("Enabling control role for bootstrap")
         roles.append(Role.CONTROL)
     is_control_node = any(role.is_control_node() for role in roles)
     is_compute_node = any(role.is_compute_node() for role in roles)
     is_storage_node = any(role.is_storage_node() for role in roles)
     is_network_node = any(role.is_network_node() for role in roles)
+    is_region_controller = any(role.is_region_controller() for role in roles)
 
     if is_network_node and is_compute_node:
         raise click.ClickException(
             "A node cannot be both a compute and network node at the same time."
+        )
+    if is_region_controller and len(roles) > 1:
+        raise click.ClickException(
+            "The region controller role is mutually exclusive with all other roles."
         )
 
     fqdn = utils.get_fqdn()
@@ -803,7 +809,7 @@ def bootstrap(
             )
         )
 
-    if is_control_node:
+    if is_control_node or is_region_controller:
         plan1.append(
             LocalEndpointsConfigurationStep(
                 client,
@@ -867,26 +873,28 @@ def bootstrap(
 
     plan2: list[BaseStep] = []
 
-    if is_control_node:
+    if is_control_node or is_region_controller:
         plan2.append(OpenStackPatchLoadBalancerServicesIPStep(client))
 
-    # NOTE(jamespage):
-    # As with MicroCeph, always deploy the openstack-hypervisor charm
-    # and add a unit to the bootstrap node if required.
-    hypervisor_tfhelper = deployment.get_tfhelper("hypervisor-plan")
-    plan2.append(TerraformInitStep(hypervisor_tfhelper))
-    plan2.append(
-        DeployHypervisorApplicationStep(
-            deployment,
-            client,
-            hypervisor_tfhelper,
-            openstack_tfhelper,
-            cinder_volume_tfhelper,
-            jhelper,
-            manifest,
-            deployment.openstack_machines_model,
+    if not is_region_controller:
+        # NOTE(jamespage):
+        # As with MicroCeph, always deploy the openstack-hypervsor charm
+        # and add a unit to the bootstrap node if required.
+        hypervisor_tfhelper = deployment.get_tfhelper("hypervisor-plan")
+        plan2.append(TerraformInitStep(hypervisor_tfhelper))
+        plan2.append(
+            DeployHypervisorApplicationStep(
+                deployment,
+                client,
+                hypervisor_tfhelper,
+                openstack_tfhelper,
+                cinder_volume_tfhelper,
+                jhelper,
+                manifest,
+                deployment.openstack_machines_model,
+            )
         )
-    )
+
     if is_network_node:
         microovn_tfhelper = deployment.get_tfhelper("microovn-plan")
         plan2.append(TerraformInitStep(microovn_tfhelper))
@@ -1177,10 +1185,15 @@ def join(
     is_compute_node = any(role.is_compute_node() for role in roles)
     is_storage_node = any(role.is_storage_node() for role in roles)
     is_network_node = any(role.is_network_node() for role in roles)
+    is_region_controller = any(role.is_region_controller() for role in roles)
 
     if is_network_node and is_compute_node:
         raise click.ClickException(
             "A node cannot be both a compute and network node at the same time."
+        )
+    if is_region_controller and len(roles) > 1:
+        raise click.ClickException(
+            "The region controller role is mutually exclusive with all other roles."
         )
 
     # Register juju user with same name as Node fqdn
@@ -1290,7 +1303,7 @@ def join(
         )
     )
 
-    if is_control_node:
+    if is_control_node or is_region_controller:
         # accept_defaults True to pick from manifest saved ones??
         plan4.append(TerraformInitStep(k8s_tfhelper))
         plan4.append(
