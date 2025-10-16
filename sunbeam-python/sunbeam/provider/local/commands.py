@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: 2024 - Canonical Ltd
 # SPDX-License-Identifier: Apache-2.0
 
+import base64
+import json
 import logging
 from pathlib import Path
 from typing import Tuple, Type
@@ -66,6 +68,7 @@ from sunbeam.core.common import (
 from sunbeam.core.deployment import Deployment, Networks
 from sunbeam.core.deployments import DeploymentsConfig, deployment_path
 from sunbeam.core.juju import (
+    JujuController,
     JujuHelper,
     JujuStepHelper,
 )
@@ -122,6 +125,7 @@ from sunbeam.steps.juju import (
     JujuLoginStep,
     MigrateModelStep,
     RegisterJujuUserStep,
+    RegisterRemoteJujuUserStep,
     RemoveJujuMachineStep,
     SaveControllerStep,
     SaveJujuAdminUserLocallyStep,
@@ -220,6 +224,7 @@ class LocalProvider(ProviderBase):
         configure.add_command(configure_dpdk)
         cluster.add_command(bootstrap)
         cluster.add_command(add)
+        cluster.add_command(add_secondary_region_node)
         cluster.add_command(join)
         cluster.add_command(list_nodes)
         cluster.add_command(remove)
@@ -590,9 +595,15 @@ def deploy_and_migrate_juju_controller(
     type=str,
     help="Juju controller name",
 )
+@click.option(
+    "--region-controller-token",
+    "region_controller_token",
+    help="Token obtained from the region controller.",
+    type=str,
+)
 @click_option_show_hints
 @click.pass_context
-def bootstrap(
+def bootstrap(  # noqa: C901
     ctx: click.Context,
     roles: list[Role],
     topology: str,
@@ -601,6 +612,7 @@ def bootstrap(
     manifest_path: Path | None = None,
     accept_defaults: bool = False,
     show_hints: bool = False,
+    region_controller_token: str | None = None,
 ) -> None:
     """Bootstrap the local node.
 
@@ -672,6 +684,8 @@ def bootstrap(
         preflight_checks.append(LxdGroupCheck())
         preflight_checks.append(LXDJujuControllerRegistrationCheck())
 
+    # TODO: validate the region controller as part of preflight checks.
+
     run_preflight_checks(preflight_checks, console)
 
     # Mark deployment as active if not yet already
@@ -721,6 +735,31 @@ def bootstrap(
     update_config(client, DEPLOYMENTS_CONFIG_KEY, deployments.get_minimal_info())
     proxy_settings = deployment.get_proxy_settings()
     LOG.debug(f"Proxy settings: {proxy_settings}")
+
+    if region_controller_token:
+        LOG.debug("Connecting to the region controller.")
+        region_controller_info = json.loads(
+            base64.b64decode(region_controller_token).decode()
+        )
+        region_controller_juju_ctrl = JujuController(
+            **region_controller_info["juju_controller"]
+        )
+        # We'll probably get the default "sunbeam-controller" name,
+        # let's add the "-region-controller" suffix to avoid duplicates.
+        region_ctrl_name = region_controller_juju_ctrl.name + "-region-controller"
+        juju_registration_token = region_controller_info["juju_registration_token"]
+
+        region_plan: list[BaseStep] = [
+            CheckJujuReachableStep(region_controller_juju_ctrl),
+            RegisterRemoteJujuUserStep(
+                juju_registration_token, region_ctrl_name, data_location
+            ),
+            SaveJujuRemoteUserLocallyStep(region_ctrl_name, data_location),
+        ]
+        # TODO: consider saving controller info, SaveControllerStep
+        run_plan(region_plan, console, show_hints)
+
+        # TODO: consume Keystone offer in the other model.
 
     if juju_controller:
         plan11: list[BaseStep] = []
@@ -1151,6 +1190,81 @@ def add(
 
 
 @click.command()
+@click.argument("name", type=str)
+@click.option(
+    "-f",
+    "--format",
+    type=click.Choice([FORMAT_DEFAULT, FORMAT_VALUE, FORMAT_YAML]),
+    default=FORMAT_DEFAULT,
+    help="Output format.",
+)
+@click.option(
+    "-o",
+    "--output",
+    type=click.Path(
+        file_okay=True,
+        dir_okay=False,
+        writable=True,
+        resolve_path=True,
+        path_type=Path,
+    ),
+    help="Output file for join token.",
+)
+@click_option_show_hints
+@click.pass_context
+def add_secondary_region_node(
+    ctx: click.Context,
+    name: str,
+    format: str,
+    output: Path | None,
+    show_hints: bool,
+) -> None:
+    """Generate a token for a secondary region node.
+
+    NAME must be a fully qualified domain name.
+    """
+    preflight_checks = [DaemonGroupCheck(), VerifyFQDNCheck(name)]
+    run_preflight_checks(preflight_checks, console)
+    name = remove_trailing_dot(name)
+
+    deployment: LocalDeployment = ctx.obj
+    client = deployment.get_client()
+    jhelper = JujuHelper(deployment.juju_controller)
+
+    plan1: list[BaseStep] = [
+        JujuLoginStep(deployment.juju_account),
+        CreateJujuUserStep(name),
+        JujuGrantModelAccessStep(jhelper, name, deployment.openstack_machines_model),
+        JujuGrantModelAccessStep(jhelper, name, OPENSTACK_MODEL),
+    ]
+
+    plan1_results = run_plan(plan1, console, show_hints)
+
+    juju_registration_token = get_step_message(plan1_results, CreateJujuUserStep)
+
+    plan2 = [ClusterAddJujuUserStep(client, name, juju_registration_token)]
+    run_plan(plan2, console, show_hints)
+
+    deployment.reload_credentials()
+    # Juju credentials are normally obtained through clusterd, however
+    # ther other regions won't be part of the same cluster. As such,
+    # we'll include this information in the join token.
+    if not deployment.juju_controller:
+        raise click.ClickException("Missing Juju controller information.")
+    token_dict = {
+        "juju_registration_token": juju_registration_token,
+        "juju_controller": deployment.juju_controller.to_dict(),
+        "name": name,
+    }
+    token = base64.b64encode(json.dumps(token_dict).encode()).decode()
+
+    if output:
+        _write_to_file(token, output)
+    else:
+        _print_output(token, format, name)
+
+
+@click.command()
 @click.argument("token", type=str)
 @click.option("-a", "--accept-defaults", help="Accept all defaults.", is_flag=True)
 @click.option(
@@ -1264,6 +1378,9 @@ def join(
         RegisterJujuUserStep(client, name, deployment.controller, data_location),
     ]
     run_plan(plan2, console, show_hints)
+
+    # TODO: login the region-controller Juju controller and consume the
+    # Keystone offer.
 
     # Loads juju account
     deployment.reload_credentials()
