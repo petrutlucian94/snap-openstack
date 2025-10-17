@@ -421,6 +421,7 @@ class DeployControlPlaneStep(BaseStep, JujuStepHelper):
         topology: str,
         machine_model: str,
         proxy_settings: dict | None = None,
+        external_keystone_model: str | None = None,
     ):
         super().__init__(
             "Deploying OpenStack Control Plane",
@@ -436,6 +437,7 @@ class DeployControlPlaneStep(BaseStep, JujuStepHelper):
         self.model = OPENSTACK_MODEL
         self.cloud = K8SHelper.get_cloud(deployment.name)
         self.database = DEFAULT_DATABASE_TOPOLOGY
+        self.external_keystone_model = external_keystone_model
 
     def get_storage_tfvars(self, storage_nodes: list[dict]) -> dict:
         """Create terraform variables related to storage."""
@@ -636,6 +638,38 @@ class DeployControlPlaneStep(BaseStep, JujuStepHelper):
                 "is-region-controller": bool(region_controllers),
             }
         )
+        if self.external_keystone_model:
+            # The model name is expected to contain the controller and owner, e.g.:
+            #   controller:owner/model
+            m = self.external_keystone_model
+            LOG.info(
+                "The Terraform Juju provider does not currently support "
+                "cross-controller relations: "
+                "https://github.com/juju/terraform-provider-juju/issues/805."
+            )
+            LOG.info(
+                "The following offers must be consumed manually: "
+                f"{m}.keystone-credentials, {m}.keystone-endpoints "
+                f"{m}.keystone-ops, {m}.cert-distributor"
+            )
+            extra_tfvars.update(
+                {
+                    "is-secondary-region": True,
+                    # Uncomment the following lines when cross-controller relation
+                    # support gets added to the Terraform Juju provider:
+                    #   https://github.com/juju/terraform-provider-juju/issues/805
+                    # The relations must be defined manually in the meantime.
+                    #
+                    # "external-keystone-offer-url":
+                    #   f"{m}.keystone-credentials",
+                    # "external-keystone-endpoints-offer-url":
+                    #   f"{m}.keystone-endpoints",
+                    # "external-keystone-ops-offer-url":
+                    #   f"{m}.keystone-ops",
+                    # "external-cert-distributor-offer-url":
+                    #   f"{m}.cert-distributor",
+                }
+            )
         self.update_status(status, "deploying services")
         try:
             self.tfhelper.update_tfvars_and_apply_tf(

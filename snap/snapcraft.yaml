@@ -146,7 +146,8 @@ parts:
     source: https://github.com/petrutlucian94/sunbeam-terraform
     source-depth: 1
     source-type: git
-    source-branch: multiregion
+    # source-branch: multiregion
+    source-commit: 1720b01f1a494155dd17a9d00f03ef817845e21f
     organize:
       '*': etc/deploy-openstack/
     override-build: |

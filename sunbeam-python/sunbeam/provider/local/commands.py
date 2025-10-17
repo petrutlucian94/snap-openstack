@@ -68,6 +68,8 @@ from sunbeam.core.common import (
 from sunbeam.core.deployment import Deployment, Networks
 from sunbeam.core.deployments import DeploymentsConfig, deployment_path
 from sunbeam.core.juju import (
+    JujuAccount,
+    JujuAccountNotFound,
     JujuController,
     JujuHelper,
     JujuStepHelper,
@@ -717,6 +719,15 @@ def bootstrap(  # noqa: C901
             bool(juju_controller),
         )
     )
+    # We'll have to switch between the bootstrap controller and the
+    # region controller, if provided.
+    deployment_controller = (
+        deployment.juju_controller.name if deployment.juju_controller else None
+    )
+    bootstrap_controller = (
+        juju_controller or deployment_controller or "localhost-localhost"
+    )
+    plan.append(SwitchToController(bootstrap_controller))
     plan.append(JujuLoginStep(deployment.juju_account))
     # bootstrapped node is always machine 0 in controller model
     plan.append(ClusterInitStep(client, roles_to_str_list(roles), 0, management_cidr))
@@ -736,6 +747,7 @@ def bootstrap(  # noqa: C901
     proxy_settings = deployment.get_proxy_settings()
     LOG.debug(f"Proxy settings: {proxy_settings}")
 
+    external_keystone_model = None
     if region_controller_token:
         LOG.debug("Connecting to the region controller.")
         region_controller_info = json.loads(
@@ -746,20 +758,48 @@ def bootstrap(  # noqa: C901
         )
         # We'll probably get the default "sunbeam-controller" name,
         # let's add the "-region-controller" suffix to avoid duplicates.
-        region_ctrl_name = region_controller_juju_ctrl.name + "-region-controller"
-        juju_registration_token = region_controller_info["juju_registration_token"]
+        region_controller_juju_ctrl.name += "-region-controller"
+        region_ctrl_name = region_controller_juju_ctrl.name
 
-        region_plan: list[BaseStep] = [
-            CheckJujuReachableStep(region_controller_juju_ctrl),
-            RegisterRemoteJujuUserStep(
-                juju_registration_token, region_ctrl_name, data_location
-            ),
-            SaveJujuRemoteUserLocallyStep(region_ctrl_name, data_location),
-        ]
-        # TODO: consider saving controller info, SaveControllerStep
+        juju_registration_token = region_controller_info["juju_registration_token"]
+        try:
+            region_ctrl_account = JujuAccount.load(
+                data_location, f"{region_ctrl_name}.yaml"
+            )
+            already_registered = True
+        except JujuAccountNotFound:
+            region_ctrl_account = None
+            already_registered = False
+
+        region_plan: list[BaseStep] = []
+        if already_registered:
+            region_plan += [
+                SwitchToController(region_ctrl_name),
+                JujuLoginStep(region_ctrl_account),
+            ]
+        else:
+            region_plan += [
+                CheckJujuReachableStep(region_controller_juju_ctrl),
+                RegisterRemoteJujuUserStep(
+                    juju_registration_token, region_ctrl_name, data_location
+                ),
+                SaveJujuRemoteUserLocallyStep(region_ctrl_name, data_location),
+            ]
+        # TODO: consider saving controller info to clusterd, SaveControllerStep
         run_plan(region_plan, console, show_hints)
 
-        # TODO: consume Keystone offer in the other model.
+        region_jhelper = JujuHelper(region_controller_juju_ctrl)
+        openstack_model_with_owner = region_jhelper.get_model_name_with_owner(
+            "openstack"
+        )
+        external_keystone_model = f"{region_ctrl_name}:{openstack_model_with_owner}"
+
+        # Switch back to the bootstrap controller.
+        region_plan2: list[BaseStep] = []
+        region_plan2 += [
+            SwitchToController(bootstrap_controller),
+        ]
+        run_plan(region_plan2, console, show_hints)
 
     if juju_controller:
         plan11: list[BaseStep] = []
@@ -865,6 +905,7 @@ def bootstrap(  # noqa: C901
                 topology,
                 deployment.openstack_machines_model,
                 proxy_settings=proxy_settings,
+                external_keystone_model=external_keystone_model,
             )
         )
         plan1.append(
